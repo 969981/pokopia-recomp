@@ -70,26 +70,47 @@ def sha256(path):
     return h.hexdigest()
 
 
-def verify(exefs):
+def verify(exefs, diagnostic=False):
     want = json.load(open(os.path.join(HERE, 'dump_hashes.json'), encoding='utf-8'))
+    errors = []
+
+    def problem(message):
+        if not diagnostic:
+            raise Fail(message)
+        errors.append(message)
+
     missing = [n for n in want['sha256'] if not os.path.isfile(os.path.join(exefs, n))]
     if missing:
-        raise Fail('The game files folder %s is missing %s. Pick the exefs of a complete dump.' % (exefs, ', '.join(missing)))
-    with open(os.path.join(exefs, 'main'), 'rb') as f:
-        head = f.read(0x60)
-    if head[:4] != b'NSO0':
-        raise Fail('exefs/main is not a decrypted NSO. Extract the game files with your own keys first (decrypted exefs and romfs).')
-    bid = head[0x40:0x54].hex()
-    if bid != want['main_build_id']:
-        raise Fail('This is a different version of the game (main build ID %s). This release supports %s (build ID %s).'
-                   % (bid, want['version'], want['main_build_id']))
+        problem('The game files folder %s is missing %s. Pick the exefs of a complete dump.' % (exefs, ', '.join(missing)))
+    if 'main' not in missing:
+        with open(os.path.join(exefs, 'main'), 'rb') as f:
+            head = f.read(0x60)
+        if len(head) < 0x60:
+            problem('exefs/main has a truncated NSO header (expected at least 96 bytes).')
+        elif head[:4] != b'NSO0':
+            problem('exefs/main is not a decrypted NSO. Extract the game files with your own keys first (decrypted exefs and romfs).')
+        else:
+            bid = head[0x40:0x54].hex()
+            if diagnostic:
+                say('build-id', bid, 'expected', want['main_build_id'])
+            if bid != want['main_build_id']:
+                problem('This is a different version of the game (main build ID %s). This release supports %s (build ID %s).'
+                        % (bid, want['version'], want['main_build_id']))
     names = list(want['sha256'])
     for i, n in enumerate(names):
+        if n in missing:
+            say('verify', n, 'missing')
+            continue
         progress('verify', i, len(names), 'Checking your game files: %s' % n)
         got = sha256(os.path.join(exefs, n))
+        if diagnostic:
+            say('verify', n, 'match' if got == want['sha256'][n] else 'mismatch', got,
+                'expected', want['sha256'][n])
         if got != want['sha256'][n]:
-            raise Fail('exefs/%s does not match the supported %s dump (sha256 %s). Re-dump the game, or check that the update %s is installed.'
-                       % (n, want['version'], got, want['version']))
+            problem('exefs/%s does not match the supported %s dump (sha256 %s). Re-dump the game, or check that the update %s is installed.'
+                    % (n, want['version'], got, want['version']))
+    if errors:
+        raise Fail('\n'.join(errors))
     progress('verify', len(names), len(names), 'Game files match %s' % want['version'])
     return want
 
@@ -264,12 +285,23 @@ def main():
     ap.add_argument('--game')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--keep', action='store_true', help='keep the generated sources and objects')
+    ap.add_argument('--verify-only', action='store_true',
+                    help='check build ID and module hashes without building or writing files; --game is not required')
     ap.add_argument('--lift-one', help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.lift_one:                       # child process: one lifter run (keeps the lifter's own pool out of this process)
         sys.path.insert(0, RECOMP)
         from nxrecomp.__main__ import main as nx_main
         return nx_main(json.loads(a.lift_one)) or 0
+    if a.verify_only:
+        if not a.exefs:
+            ap.error('--exefs is required with --verify-only')
+        try:
+            verify(a.exefs, diagnostic=True)
+            return 0
+        except Exception as e:
+            say('error', str(e).replace('\n', '\\n'))
+            return 1
     if not a.exefs or not a.game:
         ap.error('--exefs and --game are required')
     game = os.path.abspath(a.game)
