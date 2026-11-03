@@ -26,6 +26,11 @@ F1 opens the settings in game. Middle mouse toggles Joy-Con 2 mouse mode for pla
 
 ## Contributing
 
+- Check an extracted ExeFS without compiling or changing files:
+  `python game-build/release_b/pkp_build.py --verify-only --exefs <path-to-exefs>`.
+  This needs only Python, reports the main build ID and each module's SHA-256 match, and exits with 0 for a supported dump
+  or 1 for incompatible, missing or unreadable files. It does not require Zig, the runtime or `--game`.
+  Run its synthetic-file tests with `python -m unittest discover -s game-build/release_b -p test_pkp_build.py`.
 - Open pull requests against `main` and say what you tested on which GPU.
 - Code for this game goes in `recomp/games/pkp/` and `runtime/games/pkp/`; the rest is shared with other games.
 - Building from source needs Visual Studio 2022 Build Tools or newer, LLVM, CMake, Ninja, Python 3.13, .NET 8 SDK, vcpkg with `libvpx:x64-windows-static`, Rust and Node.js. Copy the game's `exefs` files to `game\dump\exefs\`, run `recomp\scripts\build_game.cmd pkp` in a Developer Command Prompt, then `pwsh -File game-build\scripts\build.ps1`. Shaders: [tools/shaders/README.md](tools/shaders/README.md). Launcher: `npm install`, `npm run tauri build` in `launcher\`.
