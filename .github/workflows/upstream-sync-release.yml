@@ -1,0 +1,137 @@
+name: Sync Pokopia upstream and publish
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
+  push:
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pokopia-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UPSTREAM_REPO: drakolordx7/pokopia-recomp
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out local main with history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge new upstream commits without overwriting local files
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse upstream/main)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo 'Already contains latest upstream main.'
+          else
+            git merge --no-commit --no-ff upstream/main
+            # Prevent accidentally introducing game dumps, console keys, or extracted Switch executables.
+            python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          files = subprocess.check_output(
+              ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"]
+          ).decode("utf-8").split("\0")
+          banned = {".xci", ".xcz", ".nsp", ".nsz", ".nca", ".ncz",
+                    ".keys", ".nso", ".nro", ".npdm", ".tik", ".cert"}
+          for name in filter(None, files):
+              path = Path(name)
+              if path.suffix.lower() in banned or path.name.lower() in {"prod.keys", "title.keys"}:
+                  raise SystemExit(f"Refusing to commit game/console data: {name}")
+          PY
+            git commit -m "Synchronize Pokopia upstream at $upstream_sha"
+            git push origin HEAD:main
+          fi
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish source snapshot for each new upstream revision
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          HEAD_SHA: ${{ steps.sync.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          short_sha="$(printf '%s' "$UPSTREAM_SHA" | cut -c1-12)"
+          tag="sync-$short_sha"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already published $tag."
+            exit 0
+          fi
+          cat > source-release-notes.md <<EOF
+          Source snapshot corresponding to upstream commit [$UPSTREAM_SHA](https://github.com/$UPSTREAM_REPO/commit/$UPSTREAM_SHA).
+
+          This release contains **source code only** (GitHub-provided source archives). It is **not** a compiled, playable Windows release.
+          For runnable installers, use the mirrored official versioned releases. The player must supply their own legally obtained game files.
+          EOF
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$HEAD_SHA" \
+            --title "Pokopia upstream source sync $short_sha" \
+            --notes-file source-release-notes.md \
+            --prerelease
+
+      - name: Mirror latest official upstream stable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(gh api "repos/$UPSTREAM_REPO/releases/latest")"
+          tag="$(printf '%s' "$release_json" | jq -r '.tag_name // empty')"
+          if [ -z "$tag" ]; then
+            echo 'Latest upstream stable release has no tag.' >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already mirrored official release $tag."
+            exit 0
+          fi
+
+          git fetch --no-tags upstream "refs/tags/$tag:refs/tags/$tag"
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            git push origin "refs/tags/$tag"
+          fi
+
+          mkdir -p upstream-release
+          gh release download "$tag" --repo "$UPSTREAM_REPO" --dir upstream-release
+          mapfile -d '' assets < <(find upstream-release -maxdepth 1 -type f -print0 | sort -z)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "Upstream $tag has no downloadable assets; refusing to publish empty binaries." >&2
+            exit 1
+          fi
+          (cd upstream-release && sha256sum -- * > SHA256SUMS.txt)
+
+          cat > official-release-notes.md <<EOF
+          Mirror of [the official Pokopia Recomp $tag release](https://github.com/$UPSTREAM_REPO/releases/tag/$tag).
+
+          **These installers were built by the upstream project and mirrored unchanged.** This fork did not compile or independently test the binaries.
+          The `SHA256SUMS.txt` file contains SHA-256 digests of all mirrored assets.
+
+          No game files or console keys are distributed. The installer requires the player's own game dump.
+          EOF
+          gh release create "$tag" "${assets[@]}" upstream-release/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Pokopia Recomp $tag (upstream installer mirror)" \
+            --notes-file official-release-notes.md
