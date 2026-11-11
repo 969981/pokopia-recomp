@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      UPSTREAM_REPO: drakolordx7/pokopia-recomp
+      UPSTREAM_REPO: drakolordx7/switch2-recomp
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -39,14 +39,35 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          # The original repository was renamed, but the new location can be
+          # private or unavailable. Never silently switch to an unverified fork.
+          if ! git ls-remote --exit-code --heads upstream main >/dev/null 2>&1; then
+            echo "::warning::Official $UPSTREAM_REPO is unavailable; retaining verified snapshot."
+            echo 'upstream_available=false' >> "$GITHUB_OUTPUT"
+            echo "Official upstream unavailable: $UPSTREAM_REPO; no new source or release mirrored." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           git fetch --no-tags upstream main
+          echo 'upstream_available=true' >> "$GITHUB_OUTPUT"
           upstream_sha="$(git rev-parse upstream/main)"
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
 
           if git merge-base --is-ancestor "$upstream_sha" HEAD; then
             echo 'Already contains latest upstream main.'
           else
-            git merge --no-commit --no-ff upstream/main
+            before="$(git rev-parse HEAD)"
+            git merge --no-commit --no-ff upstream/main || true
+            # Keep local workflows even when the upstream changes theirs.
+            git restore --source="$before" --staged --worktree -- .github/workflows
+            if [[ -n "$(git ls-files -u)" ]]; then
+              echo "::error::Source conflicts remain; manual review required."
+              git ls-files -u
+              exit 1
+            fi
+            if ! git diff --cached --quiet "$before" -- .github/workflows; then
+              echo "::error::Workflow tree changed unexpectedly."
+              exit 1
+            fi
             # Prevent accidentally introducing game dumps, console keys, or extracted Switch executables.
             python3 - <<'PY'
           import subprocess
@@ -68,6 +89,7 @@ jobs:
           echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Publish source snapshot for each new upstream revision
+        if: steps.sync.outputs.upstream_available == 'true'
         shell: bash
         env:
           UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
@@ -94,6 +116,7 @@ jobs:
             --prerelease
 
       - name: Mirror latest official upstream stable release
+        if: steps.sync.outputs.upstream_available == 'true'
         shell: bash
         run: |
           set -euo pipefail
